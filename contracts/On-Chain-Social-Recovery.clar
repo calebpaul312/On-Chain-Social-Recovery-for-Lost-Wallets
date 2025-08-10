@@ -219,3 +219,92 @@
         (ok true)
     )
 )
+
+(define-map guardian-stats
+    {wallet: principal, guardian: principal}
+    {
+        total-requests: uint,
+        total-approvals: uint,
+        total-response-time: uint,
+        last-activity: uint,
+        reliability-score: uint
+    }
+)
+
+(define-map guardian-activity-log
+    {wallet: principal, guardian: principal, request-id: uint}
+    {
+        request-created: uint,
+        approval-time: uint,
+        response-time: uint
+    }
+)
+
+(define-data-var request-counter uint u0)
+
+(define-private (update-guardian-stats (wallet principal) (guardian principal) (response-time uint))
+    (let 
+        (
+            (current-stats (default-to 
+                {total-requests: u0, total-approvals: u0, total-response-time: u0, last-activity: u0, reliability-score: u100}
+                (map-get? guardian-stats {wallet: wallet, guardian: guardian})
+            ))
+            (new-total-requests (+ (get total-requests current-stats) u1))
+            (new-total-approvals (+ (get total-approvals current-stats) u1))
+            (new-total-response-time (+ (get total-response-time current-stats) response-time))
+            (new-reliability-score (/ (* (get total-approvals current-stats) u100) new-total-requests))
+        )
+        (map-set guardian-stats {wallet: wallet, guardian: guardian}
+            {
+                total-requests: new-total-requests,
+                total-approvals: new-total-approvals,
+                total-response-time: new-total-response-time,
+                last-activity: stacks-block-height,
+                reliability-score: new-reliability-score
+            }
+        )
+    )
+)
+
+(define-private (record-activity-log (wallet principal) (guardian principal) (request-created uint))
+    (let 
+        (
+            (request-id (var-get request-counter))
+            (approval-time stacks-block-height)
+            (response-time (- approval-time request-created))
+        )
+        (map-set guardian-activity-log 
+            {wallet: wallet, guardian: guardian, request-id: request-id}
+            {
+                request-created: request-created,
+                approval-time: approval-time,
+                response-time: response-time
+            }
+        )
+        (var-set request-counter (+ request-id u1))
+        response-time
+    )
+)
+
+(define-read-only (get-guardian-stats (wallet principal) (guardian principal))
+    (map-get? guardian-stats {wallet: wallet, guardian: guardian})
+)
+
+(define-read-only (get-guardian-reliability-ranking (wallet principal))
+    (let 
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (guardians (get guardians wallet-data))
+        )
+        (ok (map get-reliability-for-guardian guardians))
+    )
+)
+
+(define-private (get-reliability-for-guardian (guardian principal))
+    (get reliability-score
+        (default-to 
+            {total-requests: u0, total-approvals: u0, total-response-time: u0, last-activity: u0, reliability-score: u100}
+            (map-get? guardian-stats {wallet: tx-sender, guardian: guardian})
+        )
+    )
+)
