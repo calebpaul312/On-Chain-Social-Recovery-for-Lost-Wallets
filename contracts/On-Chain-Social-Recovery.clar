@@ -11,6 +11,11 @@
 (define-constant err-recovery-expired (err u109))
 (define-constant err-insufficient-approvals (err u110))
 
+(define-constant err-wallet-paused (err u111))
+(define-constant err-pause-in-progress (err u112))
+(define-constant err-no-pause-request (err u113))
+(define-constant pause-duration  u72)
+
 (define-data-var recovery-delay uint u144)
 
 (define-map wallets 
@@ -306,5 +311,102 @@
             {total-requests: u0, total-approvals: u0, total-response-time: u0, last-activity: u0, reliability-score: u100}
             (map-get? guardian-stats {wallet: tx-sender, guardian: guardian})
         )
+    )
+)
+
+(define-map wallet-pause-status
+    principal
+    {
+        is-paused: bool,
+        paused-at: uint,
+        pause-expires: uint,
+        pause-reason: (string-ascii 50)
+    }
+)
+
+(define-map pause-requests
+    principal
+    {
+        requester: principal,
+        approvals: (list 10 principal),
+        created-at: uint,
+        reason: (string-ascii 50)
+    }
+)
+
+(define-public (request-emergency-pause (wallet principal) (reason (string-ascii 50)))
+    (let 
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (guardian tx-sender)
+        )
+        (asserts! (is-some (index-of (get guardians wallet-data) guardian)) err-not-guardian)
+        (asserts! (is-none (map-get? pause-requests wallet)) err-pause-in-progress)
+        
+        (map-set pause-requests wallet
+            {
+                requester: guardian,
+                approvals: (list guardian),
+                created-at: stacks-block-height,
+                reason: reason
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-emergency-pause (wallet principal))
+    (let 
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (pause-data (unwrap! (map-get? pause-requests wallet) err-no-pause-request))
+            (guardian tx-sender)
+            (required-approvals (/ (get threshold wallet-data) u2))
+        )
+        (asserts! (is-some (index-of (get guardians wallet-data) guardian)) err-not-guardian)
+        (asserts! (is-none (index-of (get approvals pause-data) guardian)) err-already-approved)
+        
+        (let ((new-approvals (unwrap! (as-max-len? (append (get approvals pause-data) guardian) u10) err-already-approved)))
+            (map-set pause-requests wallet (merge pause-data {approvals: new-approvals}))
+            
+            (if (>= (len new-approvals) required-approvals)
+                (begin
+                    (map-set wallet-pause-status wallet
+                        {
+                            is-paused: true,
+                            paused-at: stacks-block-height,
+                            pause-expires: (+ stacks-block-height pause-duration),
+                            pause-reason: (get reason pause-data)
+                        }
+                    )
+                    (map-delete pause-requests wallet)
+                    (ok true)
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (lift-emergency-pause (wallet principal))
+    (let 
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (pause-data (unwrap! (map-get? wallet-pause-status wallet) err-no-pause-request))
+        )
+        (asserts! (or 
+            (is-eq (get owner wallet-data) tx-sender)
+            (>= stacks-block-height (get pause-expires pause-data))
+        ) err-owner-only)
+        
+        (map-delete wallet-pause-status wallet)
+        (ok true)
+    )
+)
+
+(define-read-only (is-wallet-paused (wallet principal))
+    (match (map-get? wallet-pause-status wallet)
+        pause-data (get is-paused pause-data)
+        false
     )
 )
