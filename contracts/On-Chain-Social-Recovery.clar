@@ -16,6 +16,10 @@
 (define-constant err-no-pause-request (err u113))
 (define-constant pause-duration  u72)
 
+(define-constant err-rotation-not-due (err u114))
+(define-constant err-rotation-already-scheduled (err u115))
+(define-constant err-invalid-rotation-interval (err u116))
+
 (define-data-var recovery-delay uint u144)
 
 (define-map wallets 
@@ -408,5 +412,110 @@
     (match (map-get? wallet-pause-status wallet)
         pause-data (get is-paused pause-data)
         false
+    )
+)
+
+
+(define-map guardian-rotation-schedule
+    principal
+    {
+        rotation-interval: uint,
+        last-rotation: uint,
+        next-rotation: uint,
+        auto-rotate: bool
+    }
+)
+
+(define-map rotation-proposals
+    {wallet: principal, old-guardian: principal}
+    {
+        new-guardian: principal,
+        proposed-at: uint,
+        proposer: principal
+    }
+)
+
+(define-public (configure-rotation-schedule (wallet principal) (interval uint) (auto bool))
+    (let
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+        )
+        (asserts! (is-eq (get owner wallet-data) tx-sender) err-owner-only)
+        (asserts! (>= interval u1000) err-invalid-rotation-interval)
+        
+        (map-set guardian-rotation-schedule wallet
+            {
+                rotation-interval: interval,
+                last-rotation: stacks-block-height,
+                next-rotation: (+ stacks-block-height interval),
+                auto-rotate: auto
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (propose-guardian-rotation (wallet principal) (old-guardian principal) (new-guardian principal))
+    (let
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (rotation-schedule (unwrap! (map-get? guardian-rotation-schedule wallet) err-not-found))
+            (current-guardians (get guardians wallet-data))
+        )
+        (asserts! (is-eq (get owner wallet-data) tx-sender) err-owner-only)
+        (asserts! (>= stacks-block-height (get next-rotation rotation-schedule)) err-rotation-not-due)
+        (asserts! (is-some (index-of current-guardians old-guardian)) err-not-found)
+        (asserts! (is-none (index-of current-guardians new-guardian)) err-already-exists)
+        
+        (map-set rotation-proposals {wallet: wallet, old-guardian: old-guardian}
+            {
+                new-guardian: new-guardian,
+                proposed-at: stacks-block-height,
+                proposer: tx-sender
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-guardian-rotation (wallet principal) (old-guardian principal))
+    (let
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (proposal (unwrap! (map-get? rotation-proposals {wallet: wallet, old-guardian: old-guardian}) err-not-found))
+            (rotation-schedule (unwrap! (map-get? guardian-rotation-schedule wallet) err-not-found))
+            (current-guardians (get guardians wallet-data))
+        )
+        (asserts! (is-eq (get owner wallet-data) tx-sender) err-owner-only)
+        (var-set target-guardian old-guardian)
+        
+        (let
+            (
+                (filtered-guardians (filter is-not-target current-guardians))
+                (new-guardians (unwrap! (as-max-len? (append filtered-guardians (get new-guardian proposal)) u10) err-already-exists))
+            )
+            (map-set wallets wallet (merge wallet-data {guardians: new-guardians}))
+            (map-set guardian-rotation-schedule wallet
+                (merge rotation-schedule
+                    {
+                        last-rotation: stacks-block-height,
+                        next-rotation: (+ stacks-block-height (get rotation-interval rotation-schedule))
+                    }
+                )
+            )
+            (map-delete rotation-proposals {wallet: wallet, old-guardian: old-guardian})
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-rotation-schedule (wallet principal))
+    (map-get? guardian-rotation-schedule wallet)
+)
+
+(define-read-only (is-rotation-due (wallet principal))
+    (match (map-get? guardian-rotation-schedule wallet)
+        schedule (ok (>= stacks-block-height (get next-rotation schedule)))
+        err-not-found
     )
 )
