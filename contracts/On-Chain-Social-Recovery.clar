@@ -20,6 +20,12 @@
 (define-constant err-rotation-already-scheduled (err u115))
 (define-constant err-invalid-rotation-interval (err u116))
 
+(define-constant err-no-reputation (err u117))
+(define-constant err-insufficient-reward-pool (err u118))
+(define-constant err-nothing-to-claim (err u119))
+(define-constant reputation-per-approval u10)
+(define-constant min-reputation-for-claim u50)
+
 (define-data-var recovery-delay uint u144)
 
 (define-map wallets 
@@ -517,5 +523,124 @@
     (match (map-get? guardian-rotation-schedule wallet)
         schedule (ok (>= stacks-block-height (get next-rotation schedule)))
         err-not-found
+    )
+)
+
+(define-map guardian-reputation
+    {wallet: principal, guardian: principal}
+    {
+        total-reputation: uint,
+        lifetime-approvals: uint,
+        last-claim-block: uint
+    }
+)
+
+(define-map wallet-reward-pools
+    principal
+    {
+        total-deposited: uint,
+        total-claimed: uint,
+        available-balance: uint
+    }
+)
+
+(define-public (deposit-guardian-rewards (wallet principal) (amount uint))
+    (let
+        (
+            (wallet-data (unwrap! (map-get? wallets wallet) err-not-found))
+            (current-pool (default-to 
+                {total-deposited: u0, total-claimed: u0, available-balance: u0}
+                (map-get? wallet-reward-pools wallet)
+            ))
+        )
+        (asserts! (is-eq (get owner wallet-data) tx-sender) err-owner-only)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (map-set wallet-reward-pools wallet
+            {
+                total-deposited: (+ (get total-deposited current-pool) amount),
+                total-claimed: (get total-claimed current-pool),
+                available-balance: (+ (get available-balance current-pool) amount)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (award-reputation-on-approval (wallet principal) (guardian principal))
+    (let
+        (
+            (current-rep (default-to 
+                {total-reputation: u0, lifetime-approvals: u0, last-claim-block: u0}
+                (map-get? guardian-reputation {wallet: wallet, guardian: guardian})
+            ))
+        )
+        (map-set guardian-reputation {wallet: wallet, guardian: guardian}
+            {
+                total-reputation: (+ (get total-reputation current-rep) reputation-per-approval),
+                lifetime-approvals: (+ (get lifetime-approvals current-rep) u1),
+                last-claim-block: (get last-claim-block current-rep)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-guardian-rewards (wallet principal))
+    (let
+        (
+            (guardian tx-sender)
+            (rep-data (unwrap! (map-get? guardian-reputation {wallet: wallet, guardian: guardian}) err-no-reputation))
+            (pool-data (unwrap! (map-get? wallet-reward-pools wallet) err-insufficient-reward-pool))
+            (reputation-score (get total-reputation rep-data))
+            (reward-amount (/ (* reputation-score u1000) u100))
+        )
+        (asserts! (>= reputation-score min-reputation-for-claim) err-nothing-to-claim)
+        (asserts! (>= (get available-balance pool-data) reward-amount) err-insufficient-reward-pool)
+        
+        (try! (as-contract (stx-transfer? reward-amount tx-sender guardian)))
+        
+        (map-set wallet-reward-pools wallet
+            {
+                total-deposited: (get total-deposited pool-data),
+                total-claimed: (+ (get total-claimed pool-data) reward-amount),
+                available-balance: (- (get available-balance pool-data) reward-amount)
+            }
+        )
+        
+        (map-set guardian-reputation {wallet: wallet, guardian: guardian}
+            {
+                total-reputation: u0,
+                lifetime-approvals: (get lifetime-approvals rep-data),
+                last-claim-block: stacks-block-height
+            }
+        )
+        (ok reward-amount)
+    )
+)
+
+(define-read-only (get-guardian-reputation (wallet principal) (guardian principal))
+    (map-get? guardian-reputation {wallet: wallet, guardian: guardian})
+)
+
+(define-read-only (get-reward-pool-status (wallet principal))
+    (map-get? wallet-reward-pools wallet)
+)
+
+(define-read-only (calculate-claimable-rewards (wallet principal) (guardian principal))
+    (match (map-get? guardian-reputation {wallet: wallet, guardian: guardian})
+        rep-data 
+        (let
+            (
+                (reputation-score (get total-reputation rep-data))
+                (reward-amount (/ (* reputation-score u1000) u100))
+            )
+            (ok {
+                reputation: reputation-score,
+                claimable: reward-amount,
+                can-claim: (>= reputation-score min-reputation-for-claim)
+            })
+        )
+        (ok {reputation: u0, claimable: u0, can-claim: false})
     )
 )
